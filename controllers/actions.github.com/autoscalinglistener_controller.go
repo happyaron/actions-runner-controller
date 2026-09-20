@@ -38,6 +38,7 @@ import (
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1/appconfig"
 	"github.com/actions/actions-runner-controller/controllers/actions.github.com/metrics"
 	"github.com/actions/actions-runner-controller/github/actions"
+	"github.com/actions/actions-runner-controller/hash"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 )
@@ -290,7 +291,7 @@ func (r *AutoscalingListenerReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, err
 	}
 
-	if done, result, err := r.reconcileClusterRBAC(ctx, autoscalingListener, serviceAccount, log); done {
+	if done, result, err := r.reconcileClusterRBAC(ctx, &autoscalingListener, &serviceAccount, log); done {
 		return result, err
 	}
 
