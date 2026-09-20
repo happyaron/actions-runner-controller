@@ -399,3 +399,15 @@ func TestHandleDesiredRunnerCount_NilChecker(t *testing.T) {
 		w.HandleDesiredRunnerCount(context.Background(), 3) //nolint:errcheck
 	}, "nil checker should not block scale-up")
 }
+
+func TestResourceCheckDisabled(t *testing.T) {
+	assert.False(t, resourceCheckDisabled(), "resource check must be enabled when the env var is unset")
+	for _, v := range []string{"true", "1", "TRUE"} {
+		t.Setenv(EnvDisableResourceCheck, v)
+		assert.True(t, resourceCheckDisabled(), "value %q should disable the resource check", v)
+	}
+	for _, v := range []string{"false", "0", "", "bogus"} {
+		t.Setenv(EnvDisableResourceCheck, v)
+		assert.False(t, resourceCheckDisabled(), "value %q should keep the resource check enabled", v)
+	}
+}

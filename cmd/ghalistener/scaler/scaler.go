@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
+	"strconv"
 
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
 	"github.com/actions/scaleset"
@@ -16,6 +18,17 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
+
+// EnvDisableResourceCheck opts the listener out of the cluster resource check.
+// Set it to true when the listener runs against an API server that owns no
+// Nodes (e.g. a Karmada control plane): there Nodes().List succeeds but returns
+// an empty list, so the computed capacity is 0 and no runner is ever created.
+const EnvDisableResourceCheck = "ACTIONS_LISTENER_DISABLE_RESOURCE_CHECK"
+
+func resourceCheckDisabled() bool {
+	disabled, _ := strconv.ParseBool(os.Getenv(EnvDisableResourceCheck))
+	return disabled
+}
 
 type Option func(*Scaler)
 
@@ -89,7 +102,10 @@ func New(config Config, options ...Option) (*Scaler, error) {
 		return nil, err
 	}
 
-	if w.resourceChecker == nil {
+	if resourceCheckDisabled() {
+		w.logger.Info("Cluster resource check disabled by environment", "env", EnvDisableResourceCheck)
+		w.resourceChecker = nil
+	} else if w.resourceChecker == nil {
 		w.resourceChecker = NewKubernetesResourceChecker(
 			clientset,
 			conf,
