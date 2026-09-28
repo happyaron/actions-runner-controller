@@ -1,14 +1,23 @@
 package scaler
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
+	"github.com/actions/scaleset"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 var discardLogger = slog.New(slog.DiscardHandler)
@@ -398,4 +407,131 @@ func TestHandleDesiredRunnerCount_NilChecker(t *testing.T) {
 	assert.Panics(t, func() {
 		w.HandleDesiredRunnerCount(context.Background(), 3) //nolint:errcheck
 	}, "nil checker should not block scale-up")
+}
+
+// TestHandleJobStarted_JobContext asserts on the merge patch body sent to the
+// EphemeralRunner status subresource, so it shows whether an unreported value
+// was left out of the patch or sent as an empty string or a zero time.
+func TestHandleJobStarted_JobContext(t *testing.T) {
+	queueTime := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	scaleSetAssignTime := queueTime.Add(2 * time.Second)
+	runnerAssignTime := queueTime.Add(7 * time.Second)
+
+	newJobInfo := func() *scaleset.JobStarted {
+		return &scaleset.JobStarted{
+			RunnerName: "runner-1",
+			JobMessageBase: scaleset.JobMessageBase{
+				OwnerName:       "actions",
+				RepositoryName:  "actions-runner-controller",
+				JobID:           "job-1",
+				WorkflowRunID:   456,
+				JobWorkflowRef:  "actions/actions-runner-controller/.github/workflows/ci.yaml@refs/heads/main",
+				JobDisplayName:  "build",
+				RunnerRequestID: 123,
+			},
+		}
+	}
+
+	patchedStatus := func(t *testing.T, requests []recordedRequest) map[string]any {
+		t.Helper()
+
+		require.Len(t, requests, 1)
+		require.Equal(t, http.MethodPatch, requests[0].method)
+		require.Equal(t, "/apis/actions.github.com/v1alpha1/namespaces/test-ns/ephemeralrunners/runner-1/status", requests[0].path)
+		var patch map[string]any
+		require.NoError(t, json.Unmarshal([]byte(requests[0].body), &patch))
+		status, ok := patch["status"].(map[string]any)
+		require.True(t, ok, "patch has no status: %s", requests[0].body)
+		return status
+	}
+
+	t.Run("records the event name and the service timestamps", func(t *testing.T) {
+		jobInfo := newJobInfo()
+		jobInfo.EventName = "pull_request"
+		jobInfo.QueueTime = queueTime
+		jobInfo.ScaleSetAssignTime = scaleSetAssignTime
+		jobInfo.RunnerAssignTime = runnerAssignTime
+
+		scaler, requests, shutdown := newRecordingScaler(t, "test-ns")
+		defer shutdown()
+
+		require.NoError(t, scaler.HandleJobStarted(context.Background(), jobInfo))
+
+		status := patchedStatus(t, *requests)
+		assert.Equal(t, "pull_request", status["jobEventName"])
+		assert.Equal(t, queueTime.Format(time.RFC3339), status["jobQueuedAt"])
+		assert.Equal(t, scaleSetAssignTime.Format(time.RFC3339), status["jobScaleSetAssignedAt"])
+		assert.Equal(t, runnerAssignTime.Format(time.RFC3339), status["jobRunnerAssignedAt"])
+	})
+
+	t.Run("leaves out the event name and timestamps the message does not carry", func(t *testing.T) {
+		jobInfo := newJobInfo()
+		jobInfo.RunnerAssignTime = runnerAssignTime
+
+		scaler, requests, shutdown := newRecordingScaler(t, "test-ns")
+		defer shutdown()
+
+		require.NoError(t, scaler.HandleJobStarted(context.Background(), jobInfo))
+
+		status := patchedStatus(t, *requests)
+		assert.NotContains(t, status, "jobEventName")
+		assert.NotContains(t, status, "jobQueuedAt")
+		assert.NotContains(t, status, "jobScaleSetAssignedAt")
+		// The timestamp that is reported is still recorded, so the absences above
+		// are the zero values being dropped rather than the fields never being set.
+		assert.Equal(t, runnerAssignTime.Format(time.RFC3339), status["jobRunnerAssignedAt"])
+		assert.Equal(t, jobInfo.JobID, status["jobId"])
+	})
+}
+
+type recordedRequest struct {
+	method string
+	path   string
+	body   string
+}
+
+// newRecordingScaler returns a Scaler whose clientset talks to a test server
+// that records every request and answers a status PATCH with an EphemeralRunner.
+func newRecordingScaler(t *testing.T, namespace string) (*Scaler, *[]recordedRequest, func()) {
+	t.Helper()
+
+	requests := &[]recordedRequest{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body bytes.Buffer
+		_, err := body.ReadFrom(r.Body)
+		require.NoError(t, err)
+
+		*requests = append(*requests, recordedRequest{
+			method: r.Method,
+			path:   r.URL.Path,
+			body:   body.String(),
+		})
+
+		if r.Method != http.MethodPatch {
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var runner v1alpha1.EphemeralRunner
+		require.NoError(t, json.Unmarshal(body.Bytes(), &runner))
+		runner.APIVersion = v1alpha1.GroupVersion.String()
+		runner.Kind = "EphemeralRunner"
+
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(&runner))
+	}))
+
+	clientset, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
+	require.NoError(t, err)
+
+	return &Scaler{
+		clientset: clientset,
+		config: Config{
+			EphemeralRunnerSetNamespace: namespace,
+		},
+		targetRunners: -1,
+		patchSeq:      -1,
+		logger:        discardLogger,
+	}, requests, server.Close
 }

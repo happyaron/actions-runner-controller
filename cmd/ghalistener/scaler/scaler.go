@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"time"
 
 	"github.com/actions/actions-runner-controller/apis/actions.github.com/v1alpha1"
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 	jsonpatch "github.com/evanphx/json-patch"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -142,6 +144,11 @@ func (w *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStar
 				WorkflowRunID:     jobInfo.WorkflowRunID,
 				JobWorkflowRef:    jobInfo.JobWorkflowRef,
 				JobDisplayName:    jobInfo.JobDisplayName,
+				JobEventName:      jobInfo.EventName,
+
+				JobQueuedAt:           optionalTime(jobInfo.QueueTime),
+				JobScaleSetAssignedAt: optionalTime(jobInfo.ScaleSetAssignTime),
+				JobRunnerAssignedAt:   optionalTime(jobInfo.RunnerAssignTime),
 			},
 		},
 	)
@@ -178,6 +185,16 @@ func (w *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStar
 	w.logger.Info("Ephemeral runner status updated with the merge patch successfully.")
 
 	return nil
+}
+
+// optionalTime returns nil for the zero time, so a timestamp the Actions service
+// did not report is left out of the patch instead of being recorded as the zero time.
+func optionalTime(t time.Time) *metav1.Time {
+	if t.IsZero() {
+		return nil
+	}
+	mt := metav1.NewTime(t)
+	return &mt
 }
 
 func (w *Scaler) HandleJobCompleted(ctx context.Context, msg *scaleset.JobCompleted) error {
